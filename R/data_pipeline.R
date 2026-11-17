@@ -11,18 +11,30 @@ normalize_league_name <- function(value) {
 
 normalize_team_key <- function(value) {
   key <- normalize_player_key(value)
-  key <- gsub("\\b(de|del|da|do|fc|cf|sc|ac|afc|as|ssc|ss|vfl|club)\\b", " ", key)
+  key <- gsub(
+    "\\b(de|del|da|do|fc|cf|sc|ac|afc|acf|as|ssc|ss|vfl|vfb|sv|tsg|rc|rcd|cd|us|uc|bc|osc|losc|club|calcio|balompie|futbol|deportivo|olympique|racing)\\b",
+    " ",
+    key
+  )
+  key <- gsub("\\b[0-9]+\\b", " ", key)
   key <- trimws(gsub("\\s+", " ", key))
 
   aliases <- c(
-    "atletico madrid" = "atletico madrid",
+    "athletic bilbao" = "athletic",
     "bayern munich" = "bayern munchen",
     "bor monchengladbach" = "borussia monchengladbach",
+    "celta vigo" = "celta",
     "inter" = "inter milan",
     "internazionale" = "inter milan",
     "internazionale milano" = "inter milan",
+    "lazio roma" = "lazio",
+    "lille osc" = "lille",
+    "losc lille" = "lille",
+    "lyonnais" = "lyon",
     "man utd" = "manchester united",
-    "monchengladbach" = "borussia monchengladbach"
+    "monchengladbach" = "borussia monchengladbach",
+    "rayo vallecano madrid" = "rayo vallecano",
+    "strasbourg alsace" = "strasbourg"
   )
   matched_alias <- match(key, names(aliases))
   key[!is.na(matched_alias)] <- unname(aliases[matched_alias[!is.na(matched_alias)]])
@@ -71,10 +83,6 @@ add_prior_team_performance <- function(player_data, team_data) {
       .league_join_key = normalize_league_name(league),
       .season_join_key = as.integer(season)
     )
-  if (anyDuplicated(player_data_keyed[c(".team_join_key", ".league_join_key", ".season_join_key")])) {
-    stop("Player data contains duplicate league-season-team keys.", call. = FALSE)
-  }
-
   joined <- player_data_keyed %>%
     dplyr::left_join(
       team_data_keyed,

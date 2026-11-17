@@ -51,6 +51,8 @@ This analysis employs multiple machine learning models to predict player market 
 
 Models are selected using a calibration season and evaluated once on the latest season. The report includes RMSE, MAE, conventional R-squared, and a calibration-based prediction interval. The historical snapshots do not include valuation timestamps, so this is an out-of-time evaluation, not proof of a prospective forecast or market mispricing.
 
+Team context is represented by the club's **prior-season** points per game, goal difference per game, table position, and match count. These describe club context; they do not estimate an individual player's causal impact on team results.
+
 ---
 
 # Setup and Data Loading
@@ -79,13 +81,14 @@ theme_set(theme_minimal(base_size = 12))
 ## Load Datasets
 
 ```{r load-data}
-# Load datasets - UPDATE PATHS AS NEEDED
+# Load the included player and team datasets.
 stats_data <- read_csv(
-  "all_leagues_stats.csv",
+  "ststistics from all leagues.csv",
   col_types = cols(Age = col_character()),
   show_col_types = FALSE
 )
 market_data <- read_csv("market_values.csv", show_col_types = FALSE)
+team_performance <- read_csv("data/team_season_performance.csv", show_col_types = FALSE)
 
 cat("Performance Statistics Dataset:\n")
 cat("  Rows:", nrow(stats_data), "\n")
@@ -94,6 +97,10 @@ cat("  Columns:", ncol(stats_data), "\n\n")
 cat("Market Values Dataset:\n")
 cat("  Rows:", nrow(market_data), "\n")
 cat("  Columns:", ncol(market_data), "\n")
+
+cat("\nTeam Performance Dataset:\n")
+cat("  Rows:", nrow(team_performance), "\n")
+cat("  League-seasons:", nrow(distinct(team_performance, league, season_start)), "\n")
 ```
 
 ### Data Structure Preview
@@ -137,6 +144,7 @@ model_df <- merged %>%
   transmute(
     # Identifiers (not used in model)
     player_name = Player,
+    team_name = squad,
     season = season_start,
     league = league,
     
@@ -215,8 +223,27 @@ model_df <- merged %>%
     position != "OTHER"
   )
 
+model_df <- add_prior_team_performance(model_df, team_performance)
+team_context_summary <- tibble(
+  `Player-season rows` = nrow(model_df),
+  `Rows with prior-season team context` = sum(!is.na(model_df$team_points_per_game_prior)),
+  `Context match rate (%)` = round(
+    100 * mean(!is.na(model_df$team_points_per_game_prior)),
+    1
+  )
+)
+
 cat("Final modeling dataset:", nrow(model_df), "observations\n")
 cat("Features:", ncol(model_df), "columns\n")
+```
+
+## Prior-Season Team Context
+
+The standings features are shifted back one season: a player's 2023 season is joined to that club's 2022 results. The first available season has no prior baseline, and promoted clubs may also lack a prior-season record in the same league; these missing values are imputed using training-season medians with missingness indicators.
+
+```{r team-context-coverage}
+team_context_summary %>%
+  knitr::kable(caption = "Coverage of prior-season team performance features")
 ```
 
 ## Define Time-Based Evaluation Periods
@@ -386,7 +413,9 @@ numeric_feature_names <- c(
   "xg", "npxg", "xag", "xg_per90", "xag_per90",
   "prog_carries", "prog_passes", "prog_receptions",
   "yellow_cards", "red_cards", "goals_minus_xg",
-  "start_ratio", "goal_involvement"
+  "start_ratio", "goal_involvement",
+  "team_matches_played_prior", "team_points_per_game_prior",
+  "team_goal_difference_per_game_prior", "team_table_position_prior"
 )
 
 features <- model_df %>%
@@ -736,7 +765,12 @@ interval_lower <- inverse_log_market_value(test_log_prediction - interval_radius
 interval_upper <- inverse_log_market_value(test_log_prediction + interval_radius)
 
 residual_df <- model_df[test_idx, ] %>%
-  select(player_name, season, age, position, league) %>%
+  select(
+    player_name, team_name, season, age, position, league,
+    team_matches_played_prior, team_points_per_game_prior,
+    team_goal_difference_per_game_prior,
+    team_table_position_prior
+  ) %>%
   mutate(
     actual_value = y_test_original,
     predicted_value = predicted_value,
@@ -822,14 +856,22 @@ residual_df %>%
     prediction_upper_90 = round(prediction_upper_90, 2)
   ) %>%
   select(
-    player_name, age, position, league, actual_value, predicted_value,
+    player_name, team_name, age, position, league,
+    team_matches_played_prior, team_points_per_game_prior,
+    team_goal_difference_per_game_prior,
+    team_table_position_prior, actual_value, predicted_value,
     prediction_lower_90, prediction_upper_90, valuation_gap_pct
   ) %>%
   rename(
     `Player` = player_name,
+    `Club` = team_name,
     `Age` = age,
     `Position` = position,
     `League` = league,
+    `Prior team matches` = team_matches_played_prior,
+    `Prior team points/game` = team_points_per_game_prior,
+    `Prior team goal difference/game` = team_goal_difference_per_game_prior,
+    `Prior team position` = team_table_position_prior,
     `Actual (€M)` = actual_value,
     `Predicted (€M)` = predicted_value,
     `90% lower (€M)` = prediction_lower_90,
@@ -856,14 +898,22 @@ residual_df %>%
     prediction_upper_90 = round(prediction_upper_90, 2)
   ) %>%
   select(
-    player_name, age, position, league, actual_value, predicted_value,
+    player_name, team_name, age, position, league,
+    team_matches_played_prior, team_points_per_game_prior,
+    team_goal_difference_per_game_prior,
+    team_table_position_prior, actual_value, predicted_value,
     prediction_lower_90, prediction_upper_90, valuation_gap_pct
   ) %>%
   rename(
     `Player` = player_name,
+    `Club` = team_name,
     `Age` = age,
     `Position` = position,
     `League` = league,
+    `Prior team matches` = team_matches_played_prior,
+    `Prior team points/game` = team_points_per_game_prior,
+    `Prior team goal difference/game` = team_goal_difference_per_game_prior,
+    `Prior team position` = team_table_position_prior,
     `Actual (€M)` = actual_value,
     `Predicted (€M)` = predicted_value,
     `90% lower (€M)` = prediction_lower_90,
@@ -987,6 +1037,7 @@ cat("   - Age (non-linear relationship, peak at 24-28)\n")
 cat("   - Goals and assists (strong positive correlation)\n")
 cat("   - Expected goals (xG) metrics\n")
 cat("   - Playing time (minutes, starts)\n")
+cat("   - Prior-season team points, goal difference, and table position\n")
 cat("   - League (Premier League premium)\n\n")
 
 cat("3. MODEL VALUATION GAPS\n")
@@ -1003,8 +1054,9 @@ cat("   -", round(mean(residual_df$gap_status == "Market below model") * 100, 1)
 1. **Data Limitations**: Transfermarkt market values are estimates, not actual transfer fees; the snapshots do not include valuation timestamps.
 2. **Timing**: The season-level data cannot establish exactly when each valuation was observed, so the time-based holdout is not a guaranteed prospective forecast.
 3. **Feature Availability**: Some advanced metrics (xG) are unavailable for earlier seasons and are imputed from training-season medians with missingness indicators.
-4. **External Factors**: The model does not account for injury history, marketability, or contract situations.
-5. **Future Directions**:
+4. **Team Context**: Prior-season team results are contextual predictors, not causal measures of a player's contribution. Promoted clubs and the earliest data season may have missing prior-season context.
+5. **External Factors**: The model does not account for injury history, marketability, or contract situations.
+6. **Future Directions**:
    - Include defensive metrics for defenders/goalkeepers
    - Add time-series analysis for value trajectories
    - Incorporate transfer fee data for validation

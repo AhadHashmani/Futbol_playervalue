@@ -26,17 +26,23 @@ read_match_file <- function(source, season_start) {
   lines <- readLines(file_url, warn = FALSE, encoding = "UTF-8")
   post_score <- str_match(
     lines,
-    "^\\s*(?:\\d{1,2}:\\d{2}\\s+)?(.+?)\\s+(\\d+)\\s*-\\s*(\\d+)(?:\\s*\\([^)]*\\))?\\s+(.+?)\\s*$"
+    "^(?!.*\\s+v\\s+)\\s*(?:\\d{1,2}:\\d{2}\\s+)?(.+?)\\s+(\\d+)\\s*-\\s*(\\d+)(?:\\s*\\([^)]*\\))?\\s+(.+?)\\s*$"
   )
   pre_score <- str_match(
     lines,
     "^\\s*(?:\\d{1,2}:\\d{2}\\s+)?(.+?)\\s+v\\s+(.+?)\\s+(\\d+)\\s*-\\s*(\\d+)(?:\\s*\\([^)]*\\))?\\s*$"
   )
   parsed <- tibble(
-    home_team = str_trim(coalesce(post_score[, 2], pre_score[, 2])),
+    home_team = str_remove(
+      str_trim(coalesce(post_score[, 2], pre_score[, 2])),
+      "\\s+\\[[^]]+\\]$"
+    ),
     home_goals = suppressWarnings(as.integer(coalesce(post_score[, 3], pre_score[, 4]))),
     away_goals = suppressWarnings(as.integer(coalesce(post_score[, 4], pre_score[, 5]))),
-    away_team = str_trim(coalesce(post_score[, 5], pre_score[, 3]))
+    away_team = str_remove(
+      str_trim(coalesce(post_score[, 5], pre_score[, 3])),
+      "\\s+\\[[^]]+\\]$"
+    )
   ) %>%
     filter(
       !is.na(home_team),
@@ -123,9 +129,14 @@ league_coverage <- team_performance %>%
 bad_coverage <- league_coverage %>%
   filter(min_matches_per_team < 25L | max_matches_per_team > 38L)
 if (nrow(bad_coverage) > 0) {
+  bad_teams <- team_performance %>%
+    semi_join(bad_coverage, by = c("league", "season_start")) %>%
+    select(league, season_start, team_name, matches_played)
   stop(
     "Unexpected match coverage:\n",
     paste(capture.output(print(bad_coverage)), collapse = "\n"),
+    "\nTeam rows:\n",
+    paste(capture.output(print(bad_teams)), collapse = "\n"),
     call. = FALSE
   )
 }
