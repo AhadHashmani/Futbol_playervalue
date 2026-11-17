@@ -1,0 +1,2 @@
+selected_model,training_start_season,training_end_season,calibration_season,test_season,test_rows,nominal_interval_coverage,observed_test_interval_coverage,smearing_factor
+XGBoost,2014,2021,2022,2023,1538,0.9,0.9141742522756827,1.3481169471202028

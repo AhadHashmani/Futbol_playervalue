@@ -1,0 +1,14 @@
+Check,Value
+FBref input rows,30505
+Transfermarkt input rows,40520
+FBref rows missing a usable identity key,15
+Transfermarkt rows missing a usable identity key or positive value,2459
+Ambiguous FBref player-season keys excluded,2
+Ambiguous Transfermarkt player-season keys excluded,3
+FBref rows after aggregation and minutes filter,21827
+Transfermarkt rows after deduplication,37307
+Matched player-season records,14091
+Unmatched FBref records,7736
+Unmatched Transfermarkt records,23216
+FBref match rate (%),64.55765794657992
+Transfermarkt match rate (%),37.77039161551451
