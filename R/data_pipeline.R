@@ -9,6 +9,87 @@ normalize_league_name <- function(value) {
   dplyr::recode(as.character(value), "LaLiga" = "La Liga", .default = as.character(value))
 }
 
+normalize_team_key <- function(value) {
+  key <- normalize_player_key(value)
+  key <- gsub("\\b(de|del|da|do|fc|cf|sc|ac|afc|as|ssc|ss|vfl|club)\\b", " ", key)
+  key <- trimws(gsub("\\s+", " ", key))
+
+  aliases <- c(
+    "atletico madrid" = "atletico madrid",
+    "bayern munich" = "bayern munchen",
+    "bor monchengladbach" = "borussia monchengladbach",
+    "inter" = "inter milan",
+    "internazionale" = "inter milan",
+    "internazionale milano" = "inter milan",
+    "man utd" = "manchester united",
+    "monchengladbach" = "borussia monchengladbach"
+  )
+  matched_alias <- match(key, names(aliases))
+  key[!is.na(matched_alias)] <- unname(aliases[matched_alias[!is.na(matched_alias)]])
+  key
+}
+
+add_prior_team_performance <- function(player_data, team_data) {
+  player_required <- c("team_name", "league", "season")
+  team_required <- c(
+    "team_name", "league", "season_start", "matches_played",
+    "points_per_game", "goal_difference_per_game", "table_position"
+  )
+  missing_player <- setdiff(player_required, names(player_data))
+  missing_team <- setdiff(team_required, names(team_data))
+  if (length(missing_player) > 0 || length(missing_team) > 0) {
+    stop(
+      "Missing required columns. Player data: ",
+      paste(missing_player, collapse = ", "),
+      "; team data: ",
+      paste(missing_team, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  team_keys <- c("team_key", "league", "season")
+  team_data_keyed <- team_data %>%
+    dplyr::transmute(
+      team_key = normalize_team_key(team_name),
+      league = normalize_league_name(league),
+      season = as.integer(season_start) + 1L,
+      team_matches_played_prior = as.numeric(matches_played),
+      team_points_per_game_prior = as.numeric(points_per_game),
+      team_goal_difference_per_game_prior = as.numeric(goal_difference_per_game),
+      team_table_position_prior = as.numeric(table_position)
+    )
+  duplicate_team_keys <- team_data_keyed %>%
+    dplyr::count(dplyr::across(dplyr::all_of(team_keys))) %>%
+    dplyr::filter(n != 1L)
+  if (nrow(duplicate_team_keys) > 0) {
+    stop("Team data contains duplicate league-season-team keys.", call. = FALSE)
+  }
+
+  player_data_keyed <- player_data %>%
+    dplyr::mutate(
+      .team_join_key = normalize_team_key(team_name),
+      .league_join_key = normalize_league_name(league),
+      .season_join_key = as.integer(season)
+    )
+  if (anyDuplicated(player_data_keyed[c(".team_join_key", ".league_join_key", ".season_join_key")])) {
+    stop("Player data contains duplicate league-season-team keys.", call. = FALSE)
+  }
+
+  joined <- player_data_keyed %>%
+    dplyr::left_join(
+      team_data_keyed,
+      by = c(
+        ".team_join_key" = "team_key",
+        ".league_join_key" = "league",
+        ".season_join_key" = "season"
+      ),
+      relationship = "many-to-one"
+    ) %>%
+    dplyr::select(-.team_join_key, -.league_join_key, -.season_join_key)
+
+  joined
+}
+
 prepare_player_market_data <- function(stats_data, market_data, min_minutes = 450) {
   stats_required <- c(
     "Player", "Born", "Season_End_Year", "Comp", "Min_Playing", "Url",
