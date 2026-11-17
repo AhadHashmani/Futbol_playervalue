@@ -1,0 +1,27 @@
+name: R analysis CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.6.1"
+          use-public-rspm: true
+      - uses: r-lib/actions/setup-pandoc@v2
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          extra-packages: any::renv
+      - name: Restore project library
+        run: Rscript -e 'renv::restore(prompt = FALSE)'
+      - name: Run data and metric checks
+        run: Rscript tests/run_checks.R
+      - name: Render analysis report
+        run: Rscript -e 'rmarkdown::render("player_market_value_analysis.Rmd", output_format = "html_document", knit_root_dir = getwd(), envir = new.env())'
+      - name: Smoke-test dashboard
+        run: Rscript tests/run_dashboard_check.R

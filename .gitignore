@@ -1,0 +1,14 @@
+.Rhistory
+.RData
+.Rproj.user/
+/player_market_value_analysis.html
+/player_market_value_analysis_cache/
+/predicting_player_market_value.html
+/predicting_player_market_value_cache/
+/figure/
+/model_comparison.csv
+/player_valuations.csv
+/evaluation_summary.csv
+/data_quality_summary.csv
+/efficiency_by_position.csv
+/efficiency_by_league.csv

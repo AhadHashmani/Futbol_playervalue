@@ -1,6 +1,6 @@
 ---
 title: "Player Market Value Prediction Using Machine Learning"
-subtitle: "Modeling Performance Metrics and Assessing Market Efficiency"
+subtitle: "Season-Based Modeling and Valuation Gaps"
 author: "Aniketh, Palash, Jovan, Kelly"
 date: "`r Sys.Date()`"
 output:
@@ -23,11 +23,11 @@ output:
 knitr::opts_chunk$set(
   echo = TRUE,
   message = FALSE,
-  warning = FALSE,
+  warning = TRUE,
   fig.width = 10,
   fig.height = 6,
   fig.align = "center",
-  cache = TRUE
+  cache = FALSE
 )
 
 # Set seed for reproducibility
@@ -38,7 +38,7 @@ set.seed(42)
 
 ## Research Question
 
-Using transfer market data, can we model the relationship between a player's performance metrics and their market value, and predict an expected market value using machine learning? Based on this model, can we identify which players are over- or undervalued relative to their expected value, and assess market efficiency compared to a simple performance-to-cost ratio?
+Using performance metrics from earlier seasons, how accurately can models estimate player market values in a later season? How do observed valuations compare with these model estimates?
 
 ## Methodology Overview
 
@@ -49,7 +49,7 @@ This analysis employs multiple machine learning models to predict player market 
 3. **Random Forest** - Ensemble tree-based method
 4. **XGBoost** - Gradient boosting for optimal predictive performance
 
-Model performance is evaluated using **Root Mean Squared Error (RMSE)** on a held-out test set, and residual analysis identifies systematically over- or undervalued players.
+Models are selected using a calibration season and evaluated once on the latest season. The report includes RMSE, MAE, conventional R-squared, and a calibration-based prediction interval. The historical snapshots do not include valuation timestamps, so this is an out-of-time evaluation, not proof of a prospective forecast or market mispricing.
 
 ---
 
@@ -58,47 +58,21 @@ Model performance is evaluated using **Root Mean Squared Error (RMSE)** on a hel
 ## Load Required Packages
 
 ```{r load-packages}
-# Install packages if not already installed
-required_packages <- c(
-  "tidyverse",
-  "caret",
-  "xgboost",
-  "randomForest",
-  "glmnet",
-
-  "corrplot",
-  "Metrics",
-  "scales",
-  "knitr",
-  "kableExtra",
-  "gridExtra",
-  "ggrepel"
-)
-
-install_if_missing <- function(packages) {
-  new_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
-  if (length(new_packages)) {
-    install.packages(new_packages, repos = "https://cloud.r-project.org/", quiet = TRUE)
-  }
-}
-
-install_if_missing(required_packages)
-
-# Load packages
 library(tidyverse)
 library(caret)
 library(xgboost)
 library(randomForest)
 library(glmnet)
 library(corrplot)
-library(Metrics)
 library(scales)
 library(knitr)
 library(kableExtra)
 library(gridExtra)
 library(ggrepel)
 
-# Set theme for plots
+source("R/data_pipeline.R")
+source("R/model_metrics.R")
+
 theme_set(theme_minimal(base_size = 12))
 ```
 
@@ -141,69 +115,19 @@ glimpse(market_data)
 ## Clean and Standardize Data
 
 ```{r clean-data}
-# Clean stats data
-stats_clean <- stats_data %>%
-  mutate(
-    # Create join keys
-    player_name_lower = tolower(trimws(Player)),
-    season_start = Season_End_Year - 1,
-    
-    # Standardize league names
-    league = case_when(
-      Comp == "Premier League" ~ "Premier League",
-      Comp == "La Liga" ~ "La Liga",
-      Comp == "Bundesliga" ~ "Bundesliga",
-      Comp == "Serie A" ~ "Serie A",
-      Comp == "Ligue 1" ~ "Ligue 1",
-      TRUE ~ Comp
-    )
-  ) %>%
-  # Filter to meaningful playing time (at least ~5 full games)
-  filter(Min_Playing >= 450)
-
-# Clean market data
-market_clean <- market_data %>%
-  mutate(
-    player_name_lower = tolower(trimws(player_name)),
-    league = recode(comp_name, "LaLiga" = "La Liga"),
-    market_value_m = player_market_value_euro / 1e6
-  ) %>%
-  filter(
-    !is.na(player_market_value_euro),
-    player_market_value_euro > 0
-  )
+prepared_data <- prepare_player_market_data(stats_data, market_data)
+merged <- prepared_data$joined
+data_quality_summary <- prepared_data$data_quality
 
 cat("After cleaning:\n")
-cat("  Stats data:", nrow(stats_clean), "rows\n")
-cat("  Market data:", nrow(market_clean), "rows\n")
+cat("  Matched player-season records:", nrow(merged), "\n")
 ```
 
-## Merge Datasets
+## Data Quality Checks
 
-```{r merge-data}
-# Merge on player name, season, and league
-merged <- stats_clean %>%
-  inner_join(
-    market_clean,
-    by = c("player_name_lower", "season_start" = "season_start_year", "league"),
-    suffix = c("", "_market")
-  )
-
-cat("Merged dataset:", nrow(merged), "rows\n")
-
-# If too few matches, try lenient merge
-if (nrow(merged) < 2000) {
-  cat("\nTrying lenient merge (name + season only)...\n")
-  
-  merged <- stats_clean %>%
-    inner_join(
-      market_clean,
-      by = c("player_name_lower", "season_start" = "season_start_year"),
-      suffix = c("", "_market")
-    )
-  
-  cat("Lenient merge result:", nrow(merged), "rows\n")
-}
+```{r data-quality}
+data_quality_summary %>%
+  knitr::kable(caption = "Source matching and ambiguity checks")
 ```
 
 ## Feature Engineering
@@ -283,10 +207,6 @@ model_df <- merged %>%
     # Goal involvement rate
     goal_involvement = goal_assists / pmax(minutes_per_90, 1)
   ) %>%
-  # Handle missing values
-  mutate(across(c(xg, npxg, xag, xg_per90, xag_per90, goals_minus_xg,
-                  prog_carries, prog_passes, prog_receptions),
-                ~ coalesce(., 0))) %>%
   # Remove invalid observations
   filter(
     !is.na(market_value),
@@ -299,14 +219,34 @@ cat("Final modeling dataset:", nrow(model_df), "observations\n")
 cat("Features:", ncol(model_df), "columns\n")
 ```
 
+## Define Time-Based Evaluation Periods
+
+```{r evaluation-periods}
+available_seasons <- sort(unique(model_df$season))
+if (length(available_seasons) < 3) {
+  stop("At least three seasons are required for train, calibration, and test sets.")
+}
+
+test_season <- max(available_seasons)
+calibration_season <- available_seasons[length(available_seasons) - 1]
+training_seasons <- available_seasons[available_seasons < calibration_season]
+eda_df <- model_df %>% filter(season %in% training_seasons)
+
+cat("Training seasons:", min(training_seasons), "to", max(training_seasons), "\n")
+cat("Calibration season:", calibration_season, "\n")
+cat("Held-out test season:", test_season, "\n")
+```
+
 ---
 
 # Exploratory Data Analysis
 
+EDA below uses training seasons only.
+
 ## Market Value Distribution
 
 ```{r eda-distribution, fig.height=5}
-p1 <- ggplot(model_df, aes(x = market_value)) +
+p1 <- ggplot(eda_df, aes(x = market_value)) +
   geom_histogram(bins = 50, fill = "#3498db", color = "white", alpha = 0.8) +
   scale_x_continuous(labels = dollar_format(prefix = "€", suffix = "M")) +
   labs(
@@ -316,7 +256,7 @@ p1 <- ggplot(model_df, aes(x = market_value)) +
     y = "Count"
   )
 
-p2 <- ggplot(model_df, aes(x = log_market_value)) +
+p2 <- ggplot(eda_df, aes(x = log_market_value)) +
   geom_histogram(bins = 50, fill = "#e74c3c", color = "white", alpha = 0.8) +
   labs(
     title = "Distribution of Log-Transformed Market Values",
@@ -331,7 +271,7 @@ grid.arrange(p1, p2, ncol = 2)
 ## Summary Statistics
 
 ```{r eda-summary}
-model_df %>%
+eda_df %>%
   summarize(
     `Min` = min(market_value),
     `Q1` = quantile(market_value, 0.25),
@@ -349,7 +289,7 @@ model_df %>%
 ## Market Value by Position
 
 ```{r eda-position, fig.height=5}
-ggplot(model_df, aes(x = position, y = market_value, fill = position)) +
+ggplot(eda_df, aes(x = position, y = market_value, fill = position)) +
   geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
   scale_y_log10(labels = dollar_format(prefix = "€", suffix = "M")) +
   scale_fill_brewer(palette = "Set2") +
@@ -362,7 +302,7 @@ ggplot(model_df, aes(x = position, y = market_value, fill = position)) +
 ```
 
 ```{r eda-position-table}
-model_df %>%
+eda_df %>%
   group_by(position) %>%
   summarize(
     Count = n(),
@@ -379,7 +319,7 @@ model_df %>%
 ## Market Value vs Age
 
 ```{r eda-age, fig.height=5}
-ggplot(model_df, aes(x = age, y = market_value)) +
+ggplot(eda_df, aes(x = age, y = market_value)) +
   geom_point(alpha = 0.3, color = "#3498db") +
   geom_smooth(method = "loess", color = "#e74c3c", se = TRUE, linewidth = 1.2) +
   scale_y_continuous(labels = dollar_format(prefix = "€", suffix = "M")) +
@@ -395,7 +335,7 @@ ggplot(model_df, aes(x = age, y = market_value)) +
 
 ```{r eda-correlation, fig.height=8, fig.width=10}
 # Select numeric variables for correlation
-numeric_vars <- model_df %>%
+numeric_vars <- eda_df %>%
   select(market_value, age, minutes, games, goals, assists, goal_assists,
          goals_per90, assists_per90, xg, xag, prog_carries, prog_passes,
          yellow_cards, goals_minus_xg, start_ratio, goal_involvement) %>%
@@ -439,59 +379,101 @@ cor_with_target %>%
 ## Prepare Feature Matrix
 
 ```{r prepare-features}
-# Select features for modeling
+numeric_feature_names <- c(
+  "age", "minutes", "games", "starts", "minutes_per_90",
+  "goals", "assists", "goal_assists", "non_pk_goals",
+  "goals_per90", "assists_per90", "ga_per90",
+  "xg", "npxg", "xag", "xg_per90", "xag_per90",
+  "prog_carries", "prog_passes", "prog_receptions",
+  "yellow_cards", "red_cards", "goals_minus_xg",
+  "start_ratio", "goal_involvement"
+)
+
 features <- model_df %>%
-  select(
-    # Target
+  transmute(
+    player_name,
+    season,
     log_market_value,
     market_value,
-    
-    # Numeric features
-    age, minutes, games, starts, minutes_per_90,
-    goals, assists, goal_assists, non_pk_goals,
-    goals_per90, assists_per90, ga_per90,
-    xg, npxg, xag, xg_per90, xag_per90,
-    prog_carries, prog_passes, prog_receptions,
-    yellow_cards, red_cards,
-    goals_minus_xg, start_ratio, goal_involvement,
-    
-    # Categorical features
-    position, league
+    across(all_of(numeric_feature_names)),
+    position = factor(position, levels = c("GK", "DEF", "MID", "FWD")),
+    league = factor(
+      league,
+      levels = c("Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1")
+    )
   )
 
-# Create dummy variables for categorical features
-dummy_vars <- dummyVars(~ position + league, data = features, fullRank = TRUE)
-dummies <- predict(dummy_vars, newdata = features) %>% as.data.frame()
+if (anyNA(features$position) || anyNA(features$league)) {
+  stop("Unexpected position or league category in model data.")
+}
 
-# Combine numeric and dummy features
-model_matrix <- features %>%
-  select(-position, -league, -log_market_value, -market_value) %>%
-  bind_cols(dummies)
+train_idx <- which(features$season < calibration_season)
+calibration_idx <- which(features$season == calibration_season)
+test_idx <- which(features$season == test_season)
 
-# Define X and y
-X <- as.matrix(model_matrix)
-y <- features$log_market_value
-y_original <- features$market_value
+train_features <- features[train_idx, ]
+calibration_features <- features[calibration_idx, ]
+test_features <- features[test_idx, ]
 
-cat("Feature matrix dimensions:", nrow(X), "x", ncol(X), "\n")
-cat("\nFeatures included:\n")
-cat(paste(colnames(X), collapse = ", "))
+training_medians <- vapply(
+  numeric_feature_names,
+  function(column) median(train_features[[column]], na.rm = TRUE),
+  numeric(1)
+)
+if (any(!is.finite(training_medians))) {
+  stop("At least one numeric feature has no usable training values.")
+}
+
+impute_features <- function(data) {
+  for (column in numeric_feature_names) {
+    missing <- is.na(data[[column]])
+    data[[paste0(column, "_missing")]] <- as.integer(missing)
+    data[[column]][missing] <- training_medians[[column]]
+  }
+  data
+}
+
+train_features <- impute_features(train_features)
+calibration_features <- impute_features(calibration_features)
+test_features <- impute_features(test_features)
+
+dummy_vars <- dummyVars(
+  ~ position + league,
+  data = train_features,
+  fullRank = TRUE
+)
+
+make_feature_matrix <- function(data) {
+  numeric_columns <- c(numeric_feature_names, paste0(numeric_feature_names, "_missing"))
+  numeric_matrix <- data %>%
+    select(all_of(numeric_columns)) %>%
+    as.matrix()
+  categorical_matrix <- predict(dummy_vars, newdata = data) %>%
+    as.matrix()
+  cbind(numeric_matrix, categorical_matrix)
+}
+
+X_train <- make_feature_matrix(train_features)
+X_calibration <- make_feature_matrix(calibration_features)
+X_test <- make_feature_matrix(test_features)
+y_train <- train_features$log_market_value
+y_calibration <- calibration_features$log_market_value
+y_calibration_original <- calibration_features$market_value
+y_test <- test_features$log_market_value
+y_test_original <- test_features$market_value
+
+cat("Training seasons:", min(train_features$season), "to", max(train_features$season), "\n")
+cat("Calibration season:", calibration_season, "\n")
+cat("Held-out test season:", test_season, "\n")
+cat("Rows (train / calibration / test):",
+    nrow(X_train), "/", nrow(X_calibration), "/", nrow(X_test), "\n")
+cat("Features:", ncol(X_train), "\n")
 ```
 
-## Train-Test Split
+## Time-Based Train, Calibration, and Test Split
 
 ```{r train-test-split}
-# 80-20 train-test split
-train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
-
-X_train <- X[train_idx, ]
-X_test <- X[-train_idx, ]
-y_train <- y[train_idx]
-y_test <- y[-train_idx]
-y_test_original <- y_original[-train_idx]
-
-cat("Training set:", nrow(X_train), "samples\n")
-cat("Test set:", nrow(X_test), "samples\n")
+cat("The latest season is reserved for final evaluation; it is not used for fitting or model selection.\n")
 ```
 
 ---
@@ -511,20 +493,8 @@ cat("Linear Regression R-squared:", round(lm_summary$r.squared, 4), "\n")
 cat("Adjusted R-squared:", round(lm_summary$adj.r.squared, 4), "\n")
 
 # Predictions
-lm_pred_train <- predict(lm_model, newdata = data.frame(X_train))
+lm_pred_calibration <- predict(lm_model, newdata = data.frame(X_calibration))
 lm_pred_test <- predict(lm_model, newdata = data.frame(X_test))
-
-# Metrics
-lm_results <- list(
-  train_rmse = rmse(y_train, lm_pred_train),
-  test_rmse = rmse(y_test, lm_pred_test),
-  test_rmse_original = rmse(y_test_original, exp(lm_pred_test) - 1),
-  test_r2 = cor(y_test, lm_pred_test)^2
-)
-
-cat("\nTest RMSE (log scale):", round(lm_results$test_rmse, 4), "\n")
-cat("Test RMSE (millions EUR):", round(lm_results$test_rmse_original, 2), "\n")
-cat("Test R-squared:", round(lm_results$test_r2, 4), "\n")
 ```
 
 ### Top Linear Regression Coefficients
@@ -557,18 +527,8 @@ cat("Optimal lambda:", round(cv_glmnet$lambda.min, 6), "\n")
 glmnet_model <- glmnet(X_train, y_train, alpha = 0.5, lambda = cv_glmnet$lambda.min)
 
 # Predictions
+glmnet_pred_calibration <- as.vector(predict(cv_glmnet, newx = X_calibration, s = "lambda.min"))
 glmnet_pred_test <- as.vector(predict(glmnet_model, newx = X_test))
-
-# Metrics
-glmnet_results <- list(
-  test_rmse = rmse(y_test, glmnet_pred_test),
-  test_rmse_original = rmse(y_test_original, exp(glmnet_pred_test) - 1),
-  test_r2 = cor(y_test, glmnet_pred_test)^2
-)
-
-cat("Test RMSE (log scale):", round(glmnet_results$test_rmse, 4), "\n")
-cat("Test RMSE (millions EUR):", round(glmnet_results$test_rmse_original, 2), "\n")
-cat("Test R-squared:", round(glmnet_results$test_r2, 4), "\n")
 ```
 
 ```{r elasticnet-cv-plot, fig.height=5}
@@ -589,18 +549,8 @@ rf_model <- randomForest(
 )
 
 # Predictions
+rf_pred_calibration <- predict(rf_model, newdata = X_calibration)
 rf_pred_test <- predict(rf_model, newdata = X_test)
-
-# Metrics
-rf_results <- list(
-  test_rmse = rmse(y_test, rf_pred_test),
-  test_rmse_original = rmse(y_test_original, exp(rf_pred_test) - 1),
-  test_r2 = cor(y_test, rf_pred_test)^2
-)
-
-cat("Test RMSE (log scale):", round(rf_results$test_rmse, 4), "\n")
-cat("Test RMSE (millions EUR):", round(rf_results$test_rmse_original, 2), "\n")
-cat("Test R-squared:", round(rf_results$test_r2, 4), "\n")
 ```
 
 ### Random Forest Feature Importance
@@ -629,7 +579,7 @@ ggplot(rf_imp, aes(x = reorder(Feature, Importance), y = Importance)) +
 ```{r model-xgb}
 # Create DMatrix objects
 dtrain <- xgb.DMatrix(data = X_train, label = y_train)
-dtest <- xgb.DMatrix(data = X_test, label = y_test)
+dcalibration <- xgb.DMatrix(data = X_calibration, label = y_calibration)
 
 # Parameters
 xgb_params <- list(
@@ -662,24 +612,14 @@ xgb_model <- xgb.train(
   params = xgb_params,
   data = dtrain,
   nrounds = best_rounds,
-  watchlist = list(train = dtrain, test = dtest),
+  watchlist = list(train = dtrain),
   print_every_n = 50,
   verbose = 0
 )
 
 # Predictions
-xgb_pred_test <- predict(xgb_model, dtest)
-
-# Metrics
-xgb_results <- list(
-  test_rmse = rmse(y_test, xgb_pred_test),
-  test_rmse_original = rmse(y_test_original, exp(xgb_pred_test) - 1),
-  test_r2 = cor(y_test, xgb_pred_test)^2
-)
-
-cat("\nTest RMSE (log scale):", round(xgb_results$test_rmse, 4), "\n")
-cat("Test RMSE (millions EUR):", round(xgb_results$test_rmse_original, 2), "\n")
-cat("Test R-squared:", round(xgb_results$test_r2, 4), "\n")
+xgb_pred_calibration <- predict(xgb_model, dcalibration)
+xgb_pred_test <- predict(xgb_model, xgb.DMatrix(data = X_test))
 ```
 
 ### XGBoost Feature Importance
@@ -687,7 +627,7 @@ cat("Test R-squared:", round(xgb_results$test_r2, 4), "\n")
 ```{r xgb-importance, fig.height=7}
 xgb_imp <- xgb.importance(feature_names = colnames(X_train), model = xgb_model)
 
-xgb.ggplot.importance(xgb_imp[1:20, ]) +
+xgb.ggplot.importance(head(xgb_imp, 20)) +
   labs(
     title = "XGBoost Feature Importance",
     subtitle = "Top 20 features by gain"
@@ -702,29 +642,65 @@ xgb.ggplot.importance(xgb_imp[1:20, ]) +
 ## Performance Summary
 
 ```{r model-comparison}
-comparison <- data.frame(
-  Model = c("Linear Regression", "Elastic Net", "Random Forest", "XGBoost"),
-  `RMSE (Log)` = c(lm_results$test_rmse, glmnet_results$test_rmse, 
-                   rf_results$test_rmse, xgb_results$test_rmse),
-  `RMSE (€M)` = c(lm_results$test_rmse_original, glmnet_results$test_rmse_original,
-                  rf_results$test_rmse_original, xgb_results$test_rmse_original),
-  `R-Squared` = c(lm_results$test_r2, glmnet_results$test_r2, 
-                  rf_results$test_r2, xgb_results$test_r2),
-  check.names = FALSE
-) %>%
-  mutate(across(where(is.numeric), ~ round(., 4))) %>%
-  arrange(`RMSE (Log)`)
+model_predictions <- list(
+  "Linear Regression" = list(calibration = lm_pred_calibration, test = lm_pred_test),
+  "Elastic Net" = list(calibration = glmnet_pred_calibration, test = glmnet_pred_test),
+  "Random Forest" = list(calibration = rf_pred_calibration, test = rf_pred_test),
+  "XGBoost" = list(calibration = xgb_pred_calibration, test = xgb_pred_test)
+)
+
+comparison <- dplyr::bind_rows(lapply(names(model_predictions), function(model_name) {
+  predictions <- model_predictions[[model_name]]
+  smearing <- calculate_smearing_factor(y_calibration, predictions$calibration)
+  calibration_log_metrics <- calculate_regression_metrics(y_calibration, predictions$calibration)
+  calibration_euro_metrics <- calculate_regression_metrics(
+    y_calibration_original,
+    inverse_log_market_value(predictions$calibration, smearing)
+  )
+  test_log_metrics <- calculate_regression_metrics(y_test, predictions$test)
+  test_euro_metrics <- calculate_regression_metrics(
+    y_test_original,
+    inverse_log_market_value(predictions$test, smearing)
+  )
+
+  data.frame(
+    Model = model_name,
+    Smearing_Factor = smearing,
+    Calibration_RMSE_Log = calibration_log_metrics[["RMSE"]],
+    Calibration_MAE_Log = calibration_log_metrics[["MAE"]],
+    Calibration_R_squared_Log = calibration_log_metrics[["R_squared"]],
+    Calibration_RMSE_EUR_M = calibration_euro_metrics[["RMSE"]],
+    Calibration_MAE_EUR_M = calibration_euro_metrics[["MAE"]],
+    Calibration_R_squared_EUR = calibration_euro_metrics[["R_squared"]],
+    Test_RMSE_Log = test_log_metrics[["RMSE"]],
+    Test_MAE_Log = test_log_metrics[["MAE"]],
+    Test_R_squared_Log = test_log_metrics[["R_squared"]],
+    Test_RMSE_EUR_M = test_euro_metrics[["RMSE"]],
+    Test_MAE_EUR_M = test_euro_metrics[["MAE"]],
+    Test_R_squared_EUR = test_euro_metrics[["R_squared"]]
+  )
+})) %>%
+  arrange(Calibration_RMSE_Log)
+
+selected_model <- comparison$Model[[1]]
+selected_smearing_factor <- comparison$Smearing_Factor[[1]]
+selected_predictions <- model_predictions[[selected_model]]
 
 comparison %>%
-  arrange(`RMSE (Log)`) %>%
-  kable(caption = "Model Performance Comparison") %>%
+  select(
+    Model, Calibration_RMSE_Log, Test_RMSE_Log, Test_MAE_Log,
+    Test_R_squared_Log, Test_RMSE_EUR_M, Test_MAE_EUR_M, Test_R_squared_EUR
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 4))) %>%
+  kable(caption = "Calibration-selected models and final latest-season performance") %>%
   kable_styling(bootstrap_options = c("striped", "hover")) %>%
-  row_spec(which.min(comparison$`RMSE (Log)`), bold = TRUE, background = "#d4edda")
+  row_spec(1, bold = TRUE, background = "#d4edda")
 ```
 
 ```{r comparison-plot, fig.height=5}
 comparison_long <- comparison %>%
-  pivot_longer(cols = c(`RMSE (Log)`, `R-Squared`), 
+  select(Model, Test_RMSE_Log, Test_R_squared_Log) %>%
+  pivot_longer(cols = c(Test_RMSE_Log, Test_R_squared_Log),
                names_to = "Metric", values_to = "Value")
 
 ggplot(comparison_long, aes(x = reorder(Model, -Value), y = Value, fill = Model)) +
@@ -742,39 +718,51 @@ ggplot(comparison_long, aes(x = reorder(Model, -Value), y = Value, fill = Model)
 
 ---
 
-# Residual Analysis: Market Efficiency
+# Model Valuation Gaps
 
 ## Calculate Residuals
 
-Using the best-performing model (XGBoost), we calculate residuals to identify over- and undervalued players.
+The model is selected by calibration-season log RMSE. Gaps describe observed values relative to model estimates; they do not establish that a player is objectively over- or undervalued.
 
 ```{r residual-analysis}
-# Use XGBoost predictions
-best_pred <- xgb_pred_test
-best_pred_original <- exp(best_pred) - 1
+interval_radius <- calculate_conformal_radius(
+  y_calibration,
+  selected_predictions$calibration,
+  coverage = 0.9
+)
+test_log_prediction <- selected_predictions$test
+predicted_value <- inverse_log_market_value(test_log_prediction, selected_smearing_factor)
+interval_lower <- inverse_log_market_value(test_log_prediction - interval_radius)
+interval_upper <- inverse_log_market_value(test_log_prediction + interval_radius)
 
-# Create residual analysis dataframe
-test_players <- model_df[-train_idx, ]
-
-residual_df <- test_players %>%
-  select(player_name, age, position, league, season) %>%
+residual_df <- model_df[test_idx, ] %>%
+  select(player_name, season, age, position, league) %>%
   mutate(
     actual_value = y_test_original,
-    predicted_value = best_pred_original,
-    residual = actual_value - predicted_value,
-    residual_pct = (residual / pmax(predicted_value, 0.1)) * 100,
-    status = case_when(
-      residual_pct > 25 ~ "Overvalued",
-      residual_pct < -25 ~ "Undervalued",
-      TRUE ~ "Fairly Valued"
+    predicted_value = predicted_value,
+    prediction_lower_90 = interval_lower,
+    prediction_upper_90 = interval_upper,
+    valuation_gap = actual_value - predicted_value,
+    valuation_gap_pct = (valuation_gap / pmax(predicted_value, 0.1)) * 100,
+    gap_status = case_when(
+      valuation_gap_pct > 25 ~ "Market above model",
+      valuation_gap_pct < -25 ~ "Market below model",
+      TRUE ~ "Within 25%"
     )
   )
 
-# Summary
-cat("Valuation Status Distribution:\n")
-table(residual_df$status) %>% 
+interval_coverage <- mean(
+  residual_df$actual_value >= residual_df$prediction_lower_90 &
+    residual_df$actual_value <= residual_df$prediction_upper_90
+)
+cat("Selected model:", selected_model, "\n")
+cat("Calibration season:", calibration_season, "\n")
+cat("Held-out test season:", test_season, "\n")
+cat("Nominal 90% interval coverage on test season:", round(interval_coverage * 100, 1), "%\n")
+
+table(residual_df$gap_status) %>%
   as.data.frame() %>%
-  rename(Status = Var1, Count = Freq) %>%
+  rename(`Model Gap Category` = Var1, Count = Freq) %>%
   mutate(Percentage = round(Count / sum(Count) * 100, 1)) %>%
   kable() %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
@@ -783,20 +771,22 @@ table(residual_df$status) %>%
 ## Actual vs Predicted Values
 
 ```{r actual-vs-predicted, fig.height=7}
-ggplot(residual_df, aes(x = predicted_value, y = actual_value, color = status)) +
+ggplot(residual_df, aes(x = predicted_value, y = actual_value, color = gap_status)) +
   geom_point(alpha = 0.5, size = 2) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
   scale_x_continuous(labels = dollar_format(prefix = "€", suffix = "M")) +
   scale_y_continuous(labels = dollar_format(prefix = "€", suffix = "M")) +
-  scale_color_manual(values = c("Overvalued" = "#e74c3c", 
-                                "Undervalued" = "#3498db", 
-                                "Fairly Valued" = "#95a5a6")) +
+  scale_color_manual(values = c(
+    "Market above model" = "#e74c3c",
+    "Market below model" = "#3498db",
+    "Within 25%" = "#95a5a6"
+  )) +
   labs(
     title = "Actual vs Predicted Market Value",
     subtitle = "Dashed line represents perfect prediction (actual = predicted)",
     x = "Predicted Market Value (Millions EUR)",
     y = "Actual Market Value (Millions EUR)",
-    color = "Valuation Status"
+    color = "Model gap"
   ) +
   theme(legend.position = "bottom")
 ```
@@ -804,32 +794,37 @@ ggplot(residual_df, aes(x = predicted_value, y = actual_value, color = status)) 
 ## Residual Distribution
 
 ```{r residual-distribution, fig.height=5}
-ggplot(residual_df, aes(x = residual_pct)) +
+ggplot(residual_df, aes(x = valuation_gap_pct)) +
   geom_histogram(bins = 50, fill = "#9b59b6", color = "white", alpha = 0.8) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
   geom_vline(xintercept = c(-25, 25), linetype = "dotted", color = "darkgray") +
   labs(
-    title = "Distribution of Valuation Residuals",
-    subtitle = "Positive = Overvalued | Negative = Undervalued | Dotted lines = ±25% threshold",
-    x = "Residual (%)",
+    title = "Distribution of Relative Model Gaps",
+    subtitle = "Positive = market value above model | Negative = below model",
+    x = "Observed minus predicted (% of predicted value)",
     y = "Count"
   )
 ```
 
-## Top Overvalued Players
+## Largest Positive Model Gaps
 
-```{r overvalued-players}
+```{r positive-model-gaps}
 residual_df %>%
-  filter(status == "Overvalued") %>%
-  arrange(desc(residual_pct)) %>%
+  filter(gap_status == "Market above model") %>%
+  arrange(desc(valuation_gap_pct)) %>%
   head(15) %>%
   mutate(
     actual_value = round(actual_value, 2),
     predicted_value = round(predicted_value, 2),
-    residual = round(residual, 2),
-    residual_pct = round(residual_pct, 1)
+    valuation_gap = round(valuation_gap, 2),
+    valuation_gap_pct = round(valuation_gap_pct, 1),
+    prediction_lower_90 = round(prediction_lower_90, 2),
+    prediction_upper_90 = round(prediction_upper_90, 2)
   ) %>%
-  select(player_name, age, position, league, actual_value, predicted_value, residual_pct) %>%
+  select(
+    player_name, age, position, league, actual_value, predicted_value,
+    prediction_lower_90, prediction_upper_90, valuation_gap_pct
+  ) %>%
   rename(
     `Player` = player_name,
     `Age` = age,
@@ -837,26 +832,33 @@ residual_df %>%
     `League` = league,
     `Actual (€M)` = actual_value,
     `Predicted (€M)` = predicted_value,
-    `Residual (%)` = residual_pct
+    `90% lower (€M)` = prediction_lower_90,
+    `90% upper (€M)` = prediction_upper_90,
+    `Gap (%)` = valuation_gap_pct
   ) %>%
-  kable(caption = "Top 15 Most Overvalued Players") %>%
+  kable(caption = "Largest observed values above model estimates") %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
-## Top Undervalued Players
+## Largest Negative Model Gaps
 
-```{r undervalued-players}
+```{r negative-model-gaps}
 residual_df %>%
-  filter(status == "Undervalued") %>%
-  arrange(residual_pct) %>%
+  filter(gap_status == "Market below model") %>%
+  arrange(valuation_gap_pct) %>%
   head(15) %>%
   mutate(
     actual_value = round(actual_value, 2),
     predicted_value = round(predicted_value, 2),
-    residual = round(residual, 2),
-    residual_pct = round(residual_pct, 1)
+    valuation_gap = round(valuation_gap, 2),
+    valuation_gap_pct = round(valuation_gap_pct, 1),
+    prediction_lower_90 = round(prediction_lower_90, 2),
+    prediction_upper_90 = round(prediction_upper_90, 2)
   ) %>%
-  select(player_name, age, position, league, actual_value, predicted_value, residual_pct) %>%
+  select(
+    player_name, age, position, league, actual_value, predicted_value,
+    prediction_lower_90, prediction_upper_90, valuation_gap_pct
+  ) %>%
   rename(
     `Player` = player_name,
     `Age` = age,
@@ -864,100 +866,98 @@ residual_df %>%
     `League` = league,
     `Actual (€M)` = actual_value,
     `Predicted (€M)` = predicted_value,
-    `Residual (%)` = residual_pct
+    `90% lower (€M)` = prediction_lower_90,
+    `90% upper (€M)` = prediction_upper_90,
+    `Gap (%)` = valuation_gap_pct
   ) %>%
-  kable(caption = "Top 15 Most Undervalued Players") %>%
+  kable(caption = "Largest observed values below model estimates") %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
 ---
 
-# Market Efficiency by Segment
+# Model Gaps by Segment
 
-## Efficiency by Position
+## Position
 
 ```{r efficiency-position}
-efficiency_position <- residual_df %>%
+gap_by_position <- residual_df %>%
   group_by(position) %>%
   summarize(
     n = n(),
-    mean_residual_pct = mean(residual_pct, na.rm = TRUE),
-    median_residual_pct = median(residual_pct, na.rm = TRUE),
-    sd_residual_pct = sd(residual_pct, na.rm = TRUE),
-    pct_overvalued = mean(status == "Overvalued") * 100,
-    pct_undervalued = mean(status == "Undervalued") * 100,
+    mean_gap_pct = mean(valuation_gap_pct, na.rm = TRUE),
+    median_gap_pct = median(valuation_gap_pct, na.rm = TRUE),
+    pct_market_above = mean(gap_status == "Market above model") * 100,
+    pct_market_below = mean(gap_status == "Market below model") * 100,
     .groups = "drop"
   ) %>%
   mutate(across(where(is.numeric), ~ round(., 2)))
 
-efficiency_position %>%
+gap_by_position %>%
   rename(
     Position = position,
     Count = n,
-    `Mean Residual (%)` = mean_residual_pct,
-    `Median Residual (%)` = median_residual_pct,
-    `SD Residual (%)` = sd_residual_pct,
-    `% Overvalued` = pct_overvalued,
-    `% Undervalued` = pct_undervalued
+    `Mean gap (%)` = mean_gap_pct,
+    `Median gap (%)` = median_gap_pct,
+    `% market above model` = pct_market_above,
+    `% market below model` = pct_market_below
   ) %>%
-  kable(caption = "Market Efficiency by Position") %>%
+  kable(caption = "Observed-to-model gaps by position") %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
 ```{r efficiency-position-plot, fig.height=5}
-ggplot(residual_df, aes(x = position, y = residual_pct, fill = position)) +
+ggplot(residual_df, aes(x = position, y = valuation_gap_pct, fill = position)) +
   geom_boxplot(alpha = 0.7) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
   scale_fill_brewer(palette = "Set2") +
   labs(
-    title = "Valuation Residuals by Position",
-    subtitle = "Are certain positions systematically over- or undervalued?",
+    title = "Observed-to-model gaps by position",
     x = "Position",
-    y = "Residual (%)"
+    y = "Gap (%)"
   ) +
   theme(legend.position = "none")
 ```
 
-## Efficiency by League
+## League
 
 ```{r efficiency-league}
-efficiency_league <- residual_df %>%
+gap_by_league <- residual_df %>%
   group_by(league) %>%
   summarize(
     n = n(),
-    mean_residual_pct = mean(residual_pct, na.rm = TRUE),
-    median_residual_pct = median(residual_pct, na.rm = TRUE),
-    pct_overvalued = mean(status == "Overvalued") * 100,
-    pct_undervalued = mean(status == "Undervalued") * 100,
+    mean_gap_pct = mean(valuation_gap_pct, na.rm = TRUE),
+    median_gap_pct = median(valuation_gap_pct, na.rm = TRUE),
+    pct_market_above = mean(gap_status == "Market above model") * 100,
+    pct_market_below = mean(gap_status == "Market below model") * 100,
     .groups = "drop"
   ) %>%
   mutate(across(where(is.numeric), ~ round(., 2))) %>%
-  arrange(mean_residual_pct)
+  arrange(mean_gap_pct)
 
-efficiency_league %>%
+gap_by_league %>%
   rename(
     League = league,
     Count = n,
-    `Mean Residual (%)` = mean_residual_pct,
-    `Median Residual (%)` = median_residual_pct,
-    `% Overvalued` = pct_overvalued,
-    `% Undervalued` = pct_undervalued
+    `Mean gap (%)` = mean_gap_pct,
+    `Median gap (%)` = median_gap_pct,
+    `% market above model` = pct_market_above,
+    `% market below model` = pct_market_below
   ) %>%
-  kable(caption = "Market Efficiency by League") %>%
+  kable(caption = "Observed-to-model gaps by league") %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
 ```{r efficiency-league-plot, fig.height=5}
-ggplot(residual_df, aes(x = reorder(league, residual_pct, FUN = median), 
-                        y = residual_pct, fill = league)) +
+ggplot(residual_df, aes(x = reorder(league, valuation_gap_pct, FUN = median),
+                        y = valuation_gap_pct, fill = league)) +
   geom_boxplot(alpha = 0.7) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
   coord_flip() +
   labs(
-    title = "Valuation Residuals by League",
-    subtitle = "Are certain leagues systematically over- or undervalued?",
+    title = "Observed-to-model gaps by league",
     x = "League",
-    y = "Residual (%)"
+    y = "Gap (%)"
   ) +
   theme(legend.position = "none")
 ```
@@ -969,13 +969,18 @@ ggplot(residual_df, aes(x = reorder(league, residual_pct, FUN = median),
 ## Key Findings
 
 ```{r conclusions}
-best_r2 <- max(xgb_results$test_r2)
-best_rmse <- xgb_results$test_rmse_original
+selected_test_metrics <- comparison %>%
+  filter(Model == selected_model)
 
 cat("1. MODEL PERFORMANCE\n")
-cat("   - Best model: XGBoost\n")
-cat("   - Test R²:", round(best_r2, 4), "(explains", round(best_r2 * 100, 1), "% of variance)\n")
-cat("   - Test RMSE: €", round(best_rmse, 2), "M\n\n")
+cat("   - Selected on calibration season:", selected_model, "\n")
+cat("   - Held-out test season:", test_season, "\n")
+cat("   - Test RMSE: €", round(selected_test_metrics$Test_RMSE_EUR_M, 2), "M\n")
+cat("   - Test MAE: €", round(selected_test_metrics$Test_MAE_EUR_M, 2), "M\n")
+cat("   - Conventional test R-squared (euros):",
+    round(selected_test_metrics$Test_R_squared_EUR, 4), "\n")
+cat("   - Test coverage of nominal 90% interval:",
+    round(interval_coverage * 100, 1), "%\n\n")
 
 cat("2. KEY PREDICTORS OF MARKET VALUE\n")
 cat("   - Age (non-linear relationship, peak at 24-28)\n")
@@ -984,21 +989,22 @@ cat("   - Expected goals (xG) metrics\n")
 cat("   - Playing time (minutes, starts)\n")
 cat("   - League (Premier League premium)\n\n")
 
-cat("3. MARKET EFFICIENCY\n")
-cat("   - Approximately", round(mean(residual_df$status == "Fairly Valued") * 100, 1), 
-    "% of players are fairly valued (within ±25%)\n")
-cat("   -", round(mean(residual_df$status == "Overvalued") * 100, 1), 
-    "% appear overvalued\n")
-cat("   -", round(mean(residual_df$status == "Undervalued") * 100, 1), 
-    "% appear undervalued\n")
+cat("3. MODEL VALUATION GAPS\n")
+cat("   -", round(mean(residual_df$gap_status == "Within 25%") * 100, 1),
+    "% are within ±25% of the model estimate\n")
+cat("   -", round(mean(residual_df$gap_status == "Market above model") * 100, 1),
+    "% have observed values more than 25% above the model\n")
+cat("   -", round(mean(residual_df$gap_status == "Market below model") * 100, 1),
+    "% have observed values more than 25% below the model\n")
 ```
 
 ## Limitations and Future Work
 
-1. **Data Limitations**: Market values from Transfermarkt are estimates, not actual transfer fees
-2. **Feature Availability**: Some advanced metrics (xG) not available for earlier seasons
-3. **External Factors**: Model doesn't account for injury history, marketability, or contract situations
-4. **Future Directions**:
+1. **Data Limitations**: Transfermarkt market values are estimates, not actual transfer fees; the snapshots do not include valuation timestamps.
+2. **Timing**: The season-level data cannot establish exactly when each valuation was observed, so the time-based holdout is not a guaranteed prospective forecast.
+3. **Feature Availability**: Some advanced metrics (xG) are unavailable for earlier seasons and are imputed from training-season medians with missingness indicators.
+4. **External Factors**: The model does not account for injury history, marketability, or contract situations.
+5. **Future Directions**:
    - Include defensive metrics for defenders/goalkeepers
    - Add time-series analysis for value trajectories
    - Incorporate transfer fee data for validation
@@ -1016,9 +1022,22 @@ write_csv(comparison, "model_comparison.csv")
 # Save player valuations
 write_csv(residual_df, "player_valuations.csv")
 
-# Save efficiency analyses
-write_csv(efficiency_position, "efficiency_by_position.csv")
-write_csv(efficiency_league, "efficiency_by_league.csv")
+write_csv(gap_by_position, "efficiency_by_position.csv")
+write_csv(gap_by_league, "efficiency_by_league.csv")
+write_csv(data_quality_summary, "data_quality_summary.csv")
+
+evaluation_summary <- tibble(
+  selected_model = selected_model,
+  training_start_season = min(train_features$season),
+  training_end_season = max(train_features$season),
+  calibration_season = calibration_season,
+  test_season = test_season,
+  test_rows = nrow(test_features),
+  nominal_interval_coverage = 0.9,
+  observed_test_interval_coverage = interval_coverage,
+  smearing_factor = selected_smearing_factor
+)
+write_csv(evaluation_summary, "evaluation_summary.csv")
 
 cat("Results saved to CSV files.\n")
 ```

@@ -1,0 +1,196 @@
+normalize_player_key <- function(value) {
+  normalized <- stringi::stri_trans_general(as.character(value), "Latin-ASCII")
+  normalized <- tolower(normalized)
+  normalized <- gsub("[^a-z0-9]+", " ", normalized)
+  trimws(gsub("\\s+", " ", normalized))
+}
+
+normalize_league_name <- function(value) {
+  dplyr::recode(as.character(value), "LaLiga" = "La Liga", .default = as.character(value))
+}
+
+prepare_player_market_data <- function(stats_data, market_data, min_minutes = 450) {
+  stats_required <- c(
+    "Player", "Born", "Season_End_Year", "Comp", "Min_Playing", "Url",
+    "Squad", "Nation", "Pos", "Age", "MP_Playing", "Starts_Playing",
+    "Gls", "Ast", "G+A", "G_minus_PK", "PK", "PKatt", "CrdY", "CrdR",
+    "PrgC_Progression", "PrgP_Progression", "PrgR_Progression",
+    "xG_Expected", "npxG_Expected", "xAG_Expected"
+  )
+  market_required <- c(
+    "player_name", "player_dob", "player_url", "comp_name",
+    "season_start_year", "player_market_value_euro", "player_age",
+    "player_position", "country", "squad"
+  )
+  missing_stats <- setdiff(stats_required, names(stats_data))
+  missing_market <- setdiff(market_required, names(market_data))
+  if (length(missing_stats) > 0 || length(missing_market) > 0) {
+    stop(
+      "Missing required columns. FBref: ",
+      paste(missing_stats, collapse = ", "),
+      "; Transfermarkt: ",
+      paste(missing_market, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  if (!is.numeric(min_minutes) ||
+      length(min_minutes) != 1 ||
+      !is.finite(min_minutes) ||
+      min_minutes < 0) {
+    stop("min_minutes must be one non-negative number.", call. = FALSE)
+  }
+
+  key_columns <- c("player_name_key", "birth_year", "season_start", "league")
+  sum_columns <- c(
+    "MP_Playing", "Starts_Playing", "Min_Playing", "Gls", "Ast", "G+A",
+    "G_minus_PK", "PK", "PKatt", "CrdY", "CrdR", "PrgC_Progression",
+    "PrgP_Progression", "PrgR_Progression", "xG_Expected",
+    "npxG_Expected", "xAG_Expected"
+  )
+
+  stats_keyed <- stats_data %>%
+    dplyr::mutate(
+      player_name_key = normalize_player_key(Player),
+      birth_year = suppressWarnings(as.integer(Born)),
+      season_start = as.integer(Season_End_Year) - 1L,
+      league = normalize_league_name(Comp)
+    ) %>%
+    dplyr::filter(
+      !is.na(player_name_key),
+      !is.na(birth_year),
+      !is.na(season_start),
+      !is.na(Url)
+    )
+
+  stats_key_counts <- stats_keyed %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(key_columns))) %>%
+    dplyr::summarise(
+      source_ids = dplyr::n_distinct(Url),
+      .groups = "drop"
+    )
+  ambiguous_stats_keys <- sum(stats_key_counts$source_ids != 1L)
+
+  sum_if_present <- function(values) {
+    if (all(is.na(values))) NA_real_ else sum(as.numeric(values), na.rm = TRUE)
+  }
+
+  stats_clean <- stats_keyed %>%
+    dplyr::inner_join(
+      dplyr::filter(stats_key_counts, source_ids == 1L),
+      by = key_columns
+    ) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(key_columns))) %>%
+    dplyr::summarise(
+      Player = dplyr::first(Player),
+      Squad = paste(sort(unique(Squad)), collapse = "; "),
+      Comp = dplyr::first(Comp),
+      Nation = dplyr::first(Nation),
+      Pos = dplyr::first(Pos),
+      Age = dplyr::first(Age),
+      Born = dplyr::first(Born),
+      Url = dplyr::first(Url),
+      Season_End_Year = dplyr::first(Season_End_Year),
+      dplyr::across(dplyr::all_of(sum_columns), sum_if_present),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      Mins_Per_90_Playing = Min_Playing / 90,
+      Gls_Per = Gls / pmax(Mins_Per_90_Playing, 1),
+      Ast_Per = Ast / pmax(Mins_Per_90_Playing, 1),
+      `G+A_Per` = `G+A` / pmax(Mins_Per_90_Playing, 1),
+      xG_Per = xG_Expected / pmax(Mins_Per_90_Playing, 1),
+      xAG_Per = xAG_Expected / pmax(Mins_Per_90_Playing, 1)
+    ) %>%
+    dplyr::filter(Min_Playing >= min_minutes)
+
+  market_keyed <- market_data %>%
+    dplyr::mutate(
+      player_name_key = normalize_player_key(player_name),
+      birth_year = suppressWarnings(as.integer(format(as.Date(player_dob), "%Y"))),
+      season_start = as.integer(season_start_year),
+      league = normalize_league_name(comp_name)
+    ) %>%
+    dplyr::filter(
+      !is.na(player_name_key),
+      !is.na(birth_year),
+      !is.na(season_start),
+      !is.na(player_url),
+      is.finite(player_market_value_euro),
+      player_market_value_euro > 0
+    )
+
+  market_key_counts <- market_keyed %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(key_columns))) %>%
+    dplyr::summarise(
+      source_ids = dplyr::n_distinct(player_url),
+      valuations = dplyr::n_distinct(player_market_value_euro),
+      .groups = "drop"
+    )
+  ambiguous_market_keys <- sum(
+    market_key_counts$source_ids != 1L | market_key_counts$valuations != 1L
+  )
+
+  market_clean <- market_keyed %>%
+    dplyr::inner_join(
+      dplyr::filter(market_key_counts, source_ids == 1L, valuations == 1L),
+      by = key_columns
+    ) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(key_columns))) %>%
+    dplyr::summarise(
+      comp_name = dplyr::first(comp_name),
+      country = dplyr::first(country),
+      season_start_year = dplyr::first(season_start_year),
+      player_name = dplyr::first(player_name),
+      player_position = dplyr::first(player_position),
+      player_age = dplyr::first(player_age),
+      player_dob = dplyr::first(player_dob),
+      player_url = dplyr::first(player_url),
+      squad = dplyr::first(squad),
+      player_market_value_euro = dplyr::first(player_market_value_euro),
+      market_value_m = player_market_value_euro / 1e6,
+      .groups = "drop"
+    )
+
+  joined <- dplyr::inner_join(
+    stats_clean,
+    market_clean,
+    by = key_columns,
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+
+  data_quality <- tibble::tibble(
+    Check = c(
+      "FBref input rows",
+      "Transfermarkt input rows",
+      "FBref rows missing a usable identity key",
+      "Transfermarkt rows missing a usable identity key or positive value",
+      "Ambiguous FBref player-season keys excluded",
+      "Ambiguous Transfermarkt player-season keys excluded",
+      "FBref rows after aggregation and minutes filter",
+      "Transfermarkt rows after deduplication",
+      "Matched player-season records",
+      "Unmatched FBref records",
+      "Unmatched Transfermarkt records",
+      "FBref match rate (%)",
+      "Transfermarkt match rate (%)"
+    ),
+    Value = c(
+      nrow(stats_data),
+      nrow(market_data),
+      nrow(stats_data) - nrow(stats_keyed),
+      nrow(market_data) - nrow(market_keyed),
+      ambiguous_stats_keys,
+      ambiguous_market_keys,
+      nrow(stats_clean),
+      nrow(market_clean),
+      nrow(joined),
+      nrow(dplyr::anti_join(stats_clean, market_clean, by = key_columns)),
+      nrow(dplyr::anti_join(market_clean, stats_clean, by = key_columns)),
+      100 * nrow(joined) / nrow(stats_clean),
+      100 * nrow(joined) / nrow(market_clean)
+    )
+  )
+
+  list(joined = joined, data_quality = data_quality)
+}

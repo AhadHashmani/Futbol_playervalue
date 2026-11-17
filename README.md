@@ -2,31 +2,18 @@
 
 Estimating football player market values from on-field performance, then examining where observed valuations differ from model expectations. The project combines FBref statistics with Transfermarkt valuations and compares four regression approaches to support data-informed scouting and recruitment analysis.
 
-**[Read the research report](football_player_market_value_report.pdf)** · **[Explore the modeling analysis](player_market_value_analysis.Rmd)**
+**[Read the historical research report](football_player_market_value_report.pdf)** · **[Explore the current modeling analysis](player_market_value_analysis.Rmd)**
 
-## Results
+The PDF contains results from an earlier random-split analysis. The current R Markdown workflow uses time-ordered evaluation and writes fresh metrics when rendered; the historical PDF should not be used as evidence for the revised model.
 
-The research report records the following results on a held-out test set:
+## Current approach
 
-| Model | RMSE on log values | RMSE (€ millions) | Reported R²* |
-| --- | ---: | ---: | ---: |
-| XGBoost | **0.6029** | **10.2381** | **0.6311** |
-| Random Forest | 0.6207 | 11.3049 | 0.6152 |
-| Elastic Net | 0.6527 | 11.1186 | 0.5671 |
-| Linear Regression | 0.6535 | 11.1477 | 0.5661 |
+1. **Prepare and match records.** Normalize Unicode player names, use birth year to disambiguate names, standardize league names, aggregate a player's same-season club stints, and exclude ambiguous source identities. A source-matching summary is rendered and saved.
+2. **Handle missing features.** Numeric imputations are learned from training seasons only, with missingness indicators retained.
+3. **Evaluate over time.** Train on earlier seasons, select a model and calibrate prediction intervals on the penultimate season, then evaluate once on the latest season. Report RMSE, MAE, conventional R-squared, and nominal 90% interval coverage.
+4. **Interpret model gaps carefully.** Player-level outputs compare reported values with model estimates. They describe gaps, not proven market mispricing.
 
-*The analysis computes this metric as the squared correlation between predicted and observed `log1p` market values. It is distinct from the residual-based coefficient of determination on euro values.*
-
-XGBoost achieved the lowest error in the reported comparison. Its predictions feed player-level valuation tables, actual-versus-predicted plots, and residual summaries by position and league.
-
-## Approach
-
-1. **Prepare the data.** Normalize player names, align FBref season-end years with Transfermarkt season-start years, and join the sources. The modeling analysis retains players with at least 450 minutes and positive recorded valuations.
-2. **Engineer features.** Combine age, playing time, goals, assists, expected goals, progressive actions, discipline, per-90 statistics, position, and league. Model the target as `log1p(market value in € millions)`.
-3. **Compare models.** Use an 80/20 split with seed 42. Train linear regression, elastic net with 10-fold cross-validation, a 500-tree random forest, and XGBoost with five-fold cross-validation and early stopping.
-4. **Analyze valuation gaps.** Calculate observed value minus predicted value. The analysis labels gaps above +25% as “Overvalued,” below −25% as “Undervalued,” and the remainder as “Fairly Valued,” relative to the model. Percentage gaps use a €0.1M floor on predicted value.
-
-These labels describe model residuals, not proven transfer-market mispricing. Transfermarkt values are estimates, and the model does not capture every factor affecting a player's value.
+The source snapshots do not include valuation timestamps. The time-ordered test therefore measures performance on a later season, but does not guarantee a prospective forecast using only information available at valuation time.
 
 ## Data and files
 
@@ -36,59 +23,53 @@ The included snapshots contain **30,505 FBref rows** and **40,520 Transfermarkt 
 | --- | --- |
 | [football_player_market_value_report.pdf](football_player_market_value_report.pdf) | Research narrative, model comparison, visualizations, and interpretation |
 | [player_market_value_analysis.Rmd](player_market_value_analysis.Rmd) | Feature engineering, model training, evaluation, and residual analysis |
+| [R/data_pipeline.R](R/data_pipeline.R) | Name/league normalization, ambiguity checks, and source matching |
+| [R/model_metrics.R](R/model_metrics.R) | Regression metrics, log-to-euro correction, and prediction intervals |
+| [app.R](app.R) | Shiny explorer for latest-season model gaps |
+| [tests/run_checks.R](tests/run_checks.R) | Data-integrity and metric checks |
 | [predicting_player_market_value.Rmd](predicting_player_market_value.Rmd) | Exploratory analysis and commented data-collection code |
 | [all_leagues_stats.csv](all_leagues_stats.csv) | FBref performance snapshot |
 | [market_values.csv](market_values.csv) | Transfermarkt valuation snapshot |
 
 ## Reproduce the analysis
 
-Use **R and RStudio**, or R with Pandoc available. The CSV snapshots are included, so the documented workflow uses them directly.
+Use **R and RStudio**, or R with Pandoc available. The CSV snapshots are included. Dependencies are managed with `renv`:
 
 ```bash
 git clone https://github.com/anikethk1/player_market_value_prediction.git
 cd player_market_value_prediction
 ```
 
-From an R session with the repository root as the working directory, install the dependencies:
+From the repository root, restore the locked project library:
 
-```r
-install.packages(c(
-  "rmarkdown", "knitr", "tidyverse", "caret", "xgboost",
-  "randomForest", "glmnet", "corrplot", "Metrics", "scales",
-  "kableExtra", "gridExtra", "ggrepel", "reshape2"
-), repos = "https://cloud.r-project.org")
+```bash
+Rscript -e 'install.packages("renv", repos = "https://cloud.r-project.org")'
+Rscript -e 'renv::restore(prompt = FALSE)'
 ```
 
-Render the main analysis to HTML:
+After intentionally changing package dependencies, update the lockfile with `renv::snapshot()`.
 
-```r
-rmarkdown::render(
-  "player_market_value_analysis.Rmd",
-  output_format = "html_document",
-  knit_root_dir = getwd(),
-  envir = new.env()
-)
+Run the focused checks, then render the current analysis:
+
+```bash
+Rscript tests/run_checks.R
+Rscript -e 'rmarkdown::render("player_market_value_analysis.Rmd", output_format = "html_document", knit_root_dir = getwd(), envir = new.env())'
 ```
 
-This trains the four models and writes:
+The report writes:
 
-- `player_market_value_analysis.html` — the rendered analysis
-- `model_comparison.csv` — model evaluation metrics
-- `player_valuations.csv` — held-out player valuations and residuals
-- `efficiency_by_position.csv` and `efficiency_by_league.csv` — grouped residual summaries
+- `player_market_value_analysis.html` — rendered report
+- `model_comparison.csv` and `evaluation_summary.csv` — calibration/test performance and split details
+- `player_valuations.csv` — latest-season predictions, 90% intervals, and model gaps
+- `efficiency_by_position.csv`, `efficiency_by_league.csv`, and `data_quality_summary.csv` — summaries and matching diagnostics
 
-To render the separate exploratory analysis:
+Launch the interactive explorer after rendering:
 
-```r
-rmarkdown::render(
-  "predicting_player_market_value.Rmd",
-  output_format = "html_document",
-  knit_root_dir = getwd(),
-  envir = new.env()
-)
+```bash
+Rscript -e 'shiny::runApp()'
 ```
 
-The main document caches computations. Remove `player_market_value_analysis_cache/` before rerunning after changes to the input data or dependencies. Its final `sessionInfo()` section records the software environment; exact metrics can vary across package versions. Model serialization examples are in the final R Markdown appendix and are disabled by default.
+GitHub Actions runs the data checks and renders the report on pushes and pull requests.
 
 ## Project team and sources
 
