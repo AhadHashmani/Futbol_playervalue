@@ -165,7 +165,7 @@ stats_clean <- stats_data %>%
 market_clean <- market_data %>%
   mutate(
     player_name_lower = tolower(trimws(player_name)),
-    league = comp_name,
+    league = recode(comp_name, "LaLiga" = "La Liga"),
     market_value_m = player_market_value_euro / 1e6
   ) %>%
   filter(
