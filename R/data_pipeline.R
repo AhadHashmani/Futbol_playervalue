@@ -151,6 +151,10 @@ prepare_player_market_data <- function(stats_data, market_data, min_minutes = 45
       .groups = "drop"
     )
 
+  if (nrow(stats_clean) == 0 || nrow(market_clean) == 0) {
+    stop("No eligible source records remain after identity and value checks.", call. = FALSE)
+  }
+
   joined <- dplyr::inner_join(
     stats_clean,
     market_clean,
@@ -158,6 +162,9 @@ prepare_player_market_data <- function(stats_data, market_data, min_minutes = 45
     relationship = "one-to-one",
     na_matches = "never"
   )
+  if (nrow(joined) == 0) {
+    stop("No player-season records matched across both sources.", call. = FALSE)
+  }
 
   data_quality <- tibble::tibble(
     Check = c(
